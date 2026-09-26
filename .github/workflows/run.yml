@@ -12,19 +12,48 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Convert deb to IPA
+      - name: Download deb
         run: |
-          curl -L -o ${{ github.workspace }}/app.deb "${{ github.event.inputs.deb }}"
-          dpkg-deb -X ${{ github.workspace }}/app.deb ${{ github.workspace }}/app
+          set -euo pipefail
+          curl -fL --retry 3 -o "$RUNNER_TEMP/app.deb" "${{ github.event.inputs.deb }}"
+          file "$RUNNER_TEMP/app.deb"
+          if ! file "$RUNNER_TEMP/app.deb" | grep -qi "Debian binary package"; then
+            echo "::error::The URL did not return a valid .deb file. Make sure it is a DIRECT download link."
+            exit 1
+          fi
 
-          mkdir -p ${{ github.workspace }}/ipa/Payload
-          cp -R ${{ github.workspace }}/app/Applications/* ${{ github.workspace }}/ipa/Payload
-          
-          cd ${{ github.workspace }}/ipa
-          zip -r ${{ github.workspace }}/App.ipa .
+      - name: Convert deb to IPA
+        id: convert
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/app" "$RUNNER_TEMP/ipa/Payload"
+          dpkg-deb -x "$RUNNER_TEMP/app.deb" "$RUNNER_TEMP/app"
+
+          # .app bundles can live in /Applications, /var/jb/Applications, etc.
+          mapfile -t APPS < <(find "$RUNNER_TEMP/app" -maxdepth 5 -type d -name "*.app")
+          if [ "${#APPS[@]}" -eq 0 ]; then
+            echo "::error::No .app bundle found inside the deb (it is probably a tweak, not an app)."
+            exit 1
+          fi
+          for a in "${APPS[@]}"; do
+            echo "Found: $a"
+            cp -R "$a" "$RUNNER_TEMP/ipa/Payload/"
+          done
+
+          # Strip old signature / provisioning so the IPA can be re-signed
+          rm -rf "$RUNNER_TEMP"/ipa/Payload/*.app/_CodeSignature
+          rm -f  "$RUNNER_TEMP"/ipa/Payload/*.app/embedded.mobileprovision
+
+          NAME="$(basename "${APPS[0]}" .app)"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "$RUNNER_TEMP/$NAME.ipa" Payload
+          ls -lh "$RUNNER_TEMP/$NAME.ipa"
 
       - name: Upload IPA
-        uses: actions/upload-artifact@v3.1.0
+        uses: actions/upload-artifact@v4
         with:
-          name: App
-          path: ${{ github.workspace }}/App.ipa
+          name: ${{ steps.convert.outputs.name }}-ipa
+          path: ${{ runner.temp }}/${{ steps.convert.outputs.name }}.ipa
+          if-no-files-found: error
